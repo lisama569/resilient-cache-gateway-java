@@ -70,4 +70,24 @@ public class GatewayController {
         body.put("message", e.getMessage());
         return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS).body(body);
     }
+
+    /** 全局容量满、排队等待超时：429 + QUEUE_WAIT_TIMEOUT。 */
+    @ExceptionHandler(GlobalAdmissionLimiter.QueueWaitTimeoutException.class)
+    public ResponseEntity<Map<String, Object>> handleQueueWaitTimeout(
+            GlobalAdmissionLimiter.QueueWaitTimeoutException e) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("error", "QUEUE_WAIT_TIMEOUT");
+        body.put("message", e.getMessage());
+        return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS).body(body);
+    }
+
+    /** 全局等待队列已满（总量超限）：429 + CAPACITY_EXCEEDED。 */
+    @ExceptionHandler(GlobalAdmissionLimiter.CapacityExceededException.class)
+    public ResponseEntity<Map<String, Object>> handleCapacityExceeded(
+            GlobalAdmissionLimiter.CapacityExceededException e) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("error", "CAPACITY_EXCEEDED");
+        body.put("message", e.getMessage());
+        return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS).body(body);
+    }
 }

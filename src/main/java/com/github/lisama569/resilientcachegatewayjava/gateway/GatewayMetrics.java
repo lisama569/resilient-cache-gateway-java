@@ -23,12 +23,21 @@ public class GatewayMetrics {
 
     private final LongAdder totalRequests = new LongAdder();
     private final LongAdder freshHits = new LongAdder();
+    private final LongAdder staleRefreshing = new LongAdder();
     private final LongAdder staleFallbacks = new LongAdder();
     private final LongAdder degraded = new LongAdder();
     private final LongAdder rejected = new LongAdder();
     private final LongAdder upstreamCalls = new LongAdder();
     private final LongAdder upstreamFailures = new LongAdder();
     private final LongAdder coalesced = new LongAdder();
+    private final LongAdder backgroundRefreshes = new LongAdder();
+    private final LongAdder backgroundRefreshFailures = new LongAdder();
+    private final LongAdder queueWaitTimeouts = new LongAdder();
+    private final LongAdder capacityExceeded = new LongAdder();
+
+    /** 运行期状态来源，由服务装配后挂接，用于快照导出熔断与排队状态。 */
+    private volatile CircuitBreaker circuitBreaker;
+    private volatile GlobalAdmissionLimiter admissionLimiter;
 
     private final Object latencyLock = new Object();
     private final Deque<Long> latencies = new ArrayDeque<>();
@@ -39,6 +48,37 @@ public class GatewayMetrics {
 
     public void recordFresh() {
         freshHits.increment();
+    }
+
+    /** 记录一次宽限窗口内返回旧结果（后台更新中）的响应。 */
+    public void recordStaleRefreshing() {
+        staleRefreshing.increment();
+    }
+
+    /** 记录一次后台更新尝试。 */
+    public void recordBackgroundRefresh() {
+        backgroundRefreshes.increment();
+    }
+
+    /** 记录一次后台更新失败。 */
+    public void recordBackgroundRefreshFailure() {
+        backgroundRefreshFailures.increment();
+    }
+
+    /** 记录一次排队等待超时。 */
+    public void recordQueueWaitTimeout() {
+        queueWaitTimeouts.increment();
+    }
+
+    /** 记录一次总量超限（等待队列已满）拒绝。 */
+    public void recordCapacityExceeded() {
+        capacityExceeded.increment();
+    }
+
+    /** 挂接熔断器与全局限制器，供快照导出运行期状态。 */
+    public void attachRuntimeStatus(CircuitBreaker breaker, GlobalAdmissionLimiter limiter) {
+        this.circuitBreaker = breaker;
+        this.admissionLimiter = limiter;
     }
 
     public void recordStaleFallback() {
@@ -80,14 +120,37 @@ public class GatewayMetrics {
         Map<String, Object> map = new LinkedHashMap<>();
         map.put("totalRequests", totalRequests.sum());
         map.put("freshHits", freshHits.sum());
+        map.put("staleRefreshing", staleRefreshing.sum());
         map.put("staleFallbacks", staleFallbacks.sum());
         map.put("degraded", degraded.sum());
         map.put("rejected", rejected.sum());
         map.put("coalesced", coalesced.sum());
         map.put("upstreamCalls", upstreamCalls.sum());
         map.put("upstreamFailures", upstreamFailures.sum());
+        map.put("backgroundRefreshes", backgroundRefreshes.sum());
+        map.put("backgroundRefreshFailures", backgroundRefreshFailures.sum());
+        map.put("queueWaitTimeouts", queueWaitTimeouts.sum());
+        map.put("capacityExceeded", capacityExceeded.sum());
+        map.put("circuit", circuitStatus());
+        map.put("admission", admissionStatus());
         map.put("latency", latencyPercentiles());
         return map;
+    }
+
+    private Map<String, Object> circuitStatus() {
+        Map<String, Object> result = new LinkedHashMap<>();
+        CircuitBreaker breaker = circuitBreaker;
+        result.put("state", breaker != null ? breaker.state().name() : "UNKNOWN");
+        result.put("openCount", breaker != null ? breaker.openCount() : 0);
+        return result;
+    }
+
+    private Map<String, Object> admissionStatus() {
+        Map<String, Object> result = new LinkedHashMap<>();
+        GlobalAdmissionLimiter limiter = admissionLimiter;
+        result.put("inFlight", limiter != null ? limiter.inFlight() : 0);
+        result.put("waiting", limiter != null ? limiter.waiting() : 0);
+        return result;
     }
 
     private Map<String, Object> latencyPercentiles() {
