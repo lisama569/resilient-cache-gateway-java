@@ -23,12 +23,19 @@ public class GatewayMetrics {
 
     private final LongAdder totalRequests = new LongAdder();
     private final LongAdder freshHits = new LongAdder();
+    private final LongAdder staleRefreshing = new LongAdder();
     private final LongAdder staleFallbacks = new LongAdder();
     private final LongAdder degraded = new LongAdder();
     private final LongAdder rejected = new LongAdder();
     private final LongAdder upstreamCalls = new LongAdder();
     private final LongAdder upstreamFailures = new LongAdder();
     private final LongAdder coalesced = new LongAdder();
+    private final LongAdder backgroundRefreshes = new LongAdder();
+    private final LongAdder backgroundRefreshSuccesses = new LongAdder();
+    private final LongAdder backgroundRefreshFailures = new LongAdder();
+    private final LongAdder circuitRejected = new LongAdder();
+    private final LongAdder queueTimeoutRejected = new LongAdder();
+    private final LongAdder queueFullRejected = new LongAdder();
 
     private final Object latencyLock = new Object();
     private final Deque<Long> latencies = new ArrayDeque<>();
@@ -66,6 +73,41 @@ public class GatewayMetrics {
         coalesced.increment();
     }
 
+    /** 记录一次宽限窗口内返回旧值（后台更新中）。 */
+    public void recordStaleRefreshing() {
+        staleRefreshing.increment();
+    }
+
+    /** 记录一次后台更新被触发。 */
+    public void recordBackgroundRefresh() {
+        backgroundRefreshes.increment();
+    }
+
+    /** 记录一次后台更新成功。 */
+    public void recordBackgroundRefreshSuccess() {
+        backgroundRefreshSuccesses.increment();
+    }
+
+    /** 记录一次后台更新失败。 */
+    public void recordBackgroundRefreshFailure() {
+        backgroundRefreshFailures.increment();
+    }
+
+    /** 记录一次因熔断保护而未访问上游。 */
+    public void recordCircuitRejected() {
+        circuitRejected.increment();
+    }
+
+    /** 记录一次全局排队等待超时拒绝。 */
+    public void recordQueueTimeoutRejected() {
+        queueTimeoutRejected.increment();
+    }
+
+    /** 记录一次全局队列已满拒绝。 */
+    public void recordQueueFullRejected() {
+        queueFullRejected.increment();
+    }
+
     public void recordLatency(long elapsedMillis) {
         synchronized (latencyLock) {
             if (latencies.size() >= LATENCY_WINDOW) {
@@ -80,12 +122,19 @@ public class GatewayMetrics {
         Map<String, Object> map = new LinkedHashMap<>();
         map.put("totalRequests", totalRequests.sum());
         map.put("freshHits", freshHits.sum());
+        map.put("staleRefreshing", staleRefreshing.sum());
         map.put("staleFallbacks", staleFallbacks.sum());
         map.put("degraded", degraded.sum());
         map.put("rejected", rejected.sum());
         map.put("coalesced", coalesced.sum());
         map.put("upstreamCalls", upstreamCalls.sum());
         map.put("upstreamFailures", upstreamFailures.sum());
+        map.put("backgroundRefreshes", backgroundRefreshes.sum());
+        map.put("backgroundRefreshSuccesses", backgroundRefreshSuccesses.sum());
+        map.put("backgroundRefreshFailures", backgroundRefreshFailures.sum());
+        map.put("circuitRejected", circuitRejected.sum());
+        map.put("queueTimeoutRejected", queueTimeoutRejected.sum());
+        map.put("queueFullRejected", queueFullRejected.sum());
         map.put("latency", latencyPercentiles());
         return map;
     }

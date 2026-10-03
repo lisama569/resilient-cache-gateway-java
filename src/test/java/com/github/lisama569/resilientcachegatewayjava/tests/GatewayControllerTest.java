@@ -58,10 +58,19 @@ class GatewayControllerTest {
     void metricsEndpointExportsCountersAndPercentiles() {
         rest.getForEntity("/api/data/metrics-key", Map.class);
         ResponseEntity<Map> r = rest.getForEntity("/api/metrics", Map.class);
-        log.info("[case] 指标导出: body={} 判定依据=包含请求量/命中/耗时分位", r.getBody());
+        log.info("[case] 指标导出: body={} 判定依据=包含请求量/命中/耗时分位/熔断状态/全局队列水位", r.getBody());
         assertEquals(HttpStatus.OK, r.getStatusCode());
         assertTrue(((Number) r.getBody().get("totalRequests")).longValue() >= 1);
         assertNotNull(r.getBody().get("freshHits"));
+        assertNotNull(r.getBody().get("staleRefreshing"));
+        assertNotNull(r.getBody().get("backgroundRefreshes"));
+        assertNotNull(r.getBody().get("queueTimeoutRejected"));
+        assertNotNull(r.getBody().get("queueFullRejected"));
+        assertNotNull(r.getBody().get("circuitRejected"));
+        // 熔断与全局队列运行状态
+        assertNotNull(r.getBody().get("circuitState"));
+        assertNotNull(r.getBody().get("globalQueueWaiters"));
+        assertNotNull(r.getBody().get("globalAvailablePermits"));
         Map<?, ?> latency = (Map<?, ?>) r.getBody().get("latency");
         assertNotNull(latency);
         assertNotNull(latency.get("p50"));

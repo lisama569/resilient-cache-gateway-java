@@ -1,9 +1,11 @@
 package com.github.lisama569.resilientcachegatewayjava.tests;
 
 import com.github.lisama569.resilientcachegatewayjava.gateway.CacheGatewayService;
+import com.github.lisama569.resilientcachegatewayjava.gateway.CircuitBreaker;
 import com.github.lisama569.resilientcachegatewayjava.gateway.GatewayMetrics;
 import com.github.lisama569.resilientcachegatewayjava.gateway.GatewayProperties;
 import com.github.lisama569.resilientcachegatewayjava.gateway.GatewayResponse;
+import com.github.lisama569.resilientcachegatewayjava.gateway.GlobalAdmissionGuard;
 import com.github.lisama569.resilientcachegatewayjava.gateway.ResultOrigin;
 import com.github.lisama569.resilientcachegatewayjava.gateway.SimulatedUpstream;
 import org.junit.jupiter.api.BeforeEach;
@@ -36,6 +38,8 @@ class CacheGatewayServiceTest {
     private GatewayProperties properties;
     private SimulatedUpstream upstream;
     private GatewayMetrics metrics;
+    private CircuitBreaker circuitBreaker;
+    private GlobalAdmissionGuard globalGuard;
     private CacheGatewayService service;
 
     @BeforeEach
@@ -46,13 +50,17 @@ class CacheGatewayServiceTest {
         properties.setMaxConcurrentPerKey(8);
         properties.setSimulatedLatencyMillis(20);
         properties.setSimulatedFailure(false);
+        // 本测试类验证上一轮既有行为：显式关闭宽限窗口，保持"过期即同步回源"的旧语义
+        properties.setStaleGraceMillis(0);
         upstream = new SimulatedUpstream(properties);
         metrics = new GatewayMetrics();
-        service = new CacheGatewayService(properties, upstream, metrics);
-        log.info("[setup] ttlMs={} timeoutMs={} maxConcurrentPerKey={} latencyMs={} failure={}",
+        circuitBreaker = new CircuitBreaker(properties);
+        globalGuard = new GlobalAdmissionGuard(properties);
+        service = new CacheGatewayService(properties, upstream, metrics, circuitBreaker, globalGuard);
+        log.info("[setup] ttlMs={} timeoutMs={} maxConcurrentPerKey={} latencyMs={} failure={} staleGraceMs={}",
                 properties.getCacheTtlMillis(), properties.getUpstreamTimeoutMillis(),
                 properties.getMaxConcurrentPerKey(), properties.getSimulatedLatencyMillis(),
-                properties.isSimulatedFailure());
+                properties.isSimulatedFailure(), properties.getStaleGraceMillis());
     }
 
     @Test

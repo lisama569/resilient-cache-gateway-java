@@ -38,10 +38,12 @@ public class GatewayController {
         return gatewayService.get(key);
     }
 
-    /** 导出指标快照。 */
+    /** 导出指标快照（含熔断状态与全局队列水位）。 */
     @GetMapping("/metrics")
     public Map<String, Object> getMetrics() {
-        return metrics.snapshot();
+        Map<String, Object> snapshot = new LinkedHashMap<>(metrics.snapshot());
+        snapshot.putAll(gatewayService.status());
+        return snapshot;
     }
 
     /** 运行期调整模拟上游行为，便于本地复现超时与故障场景。 */
@@ -67,6 +69,28 @@ public class GatewayController {
             CacheGatewayService.OverloadRejectedException e) {
         Map<String, Object> body = new LinkedHashMap<>();
         body.put("error", "OVERLOAD_REJECTED");
+        body.put("message", e.getMessage());
+        return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS).body(body);
+    }
+
+    /** 全局排队等待超时：429 + QUEUE_TIMEOUT，与队列满可区分。 */
+    @ExceptionHandler(GlobalAdmissionGuard.QueueTimeoutRejectedException.class)
+    public ResponseEntity<Map<String, Object>> handleQueueTimeout(
+            GlobalAdmissionGuard.QueueTimeoutRejectedException e) {
+        metrics.recordQueueTimeoutRejected();
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("error", "QUEUE_TIMEOUT");
+        body.put("message", e.getMessage());
+        return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS).body(body);
+    }
+
+    /** 全局等待队列已满（总量超过上限）：429 + QUEUE_FULL。 */
+    @ExceptionHandler(GlobalAdmissionGuard.QueueFullRejectedException.class)
+    public ResponseEntity<Map<String, Object>> handleQueueFull(
+            GlobalAdmissionGuard.QueueFullRejectedException e) {
+        metrics.recordQueueFullRejected();
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("error", "QUEUE_FULL");
         body.put("message", e.getMessage());
         return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS).body(body);
     }
