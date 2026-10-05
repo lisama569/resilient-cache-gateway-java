@@ -33,7 +33,7 @@ client → GatewayController → CacheGatewayService → SimulatedUpstream
 |---|---|---|
 | `FRESH` | 新鲜数据 | 缓存命中，或回源成功（含后台更新成功后的读取） |
 | `STALE_REFRESHING` | 宽限窗口内的旧结果 | 缓存刚过期但在宽限窗口内、后台更新失败次数未达上限；同时后台只触发一次更新 |
-| `STALE_FALLBACK` | 过期兜底 | 回源超时/失败（或熔断保护期），且存在已过期缓存，返回旧值并明确标记 |
+| `STALE_FALLBACK` | 过期兜底 | 回源超时/失败、熔断保护期，或容量占满（排队没等到/总量超限）但手里还有旧结果时，返回旧值并明确标记 |
 | `DEGRADED` | 降级结果 | 回源超时/失败（或熔断保护期），且无任何缓存，`value=null` |
 
 - 上游调用有超时（`gateway.upstream-timeout-millis`），超时后中断慢调用，避免请求堆积。
@@ -46,8 +46,11 @@ client → GatewayController → CacheGatewayService → SimulatedUpstream
 - 窗口内：请求**立即**拿到上一份旧结果（`origin=STALE_REFRESHING`，与最新数据明确区分），
   同时同一 key 只触发**一次**后台更新；更新进行中再来的请求复用这次更新，不重复触发。
 - 后台更新成功后写缓存，后续读取立刻看到新结果（`FRESH`）。
-- 后台更新连续失败达到 `gateway.swr-max-background-failures` 次，或宽限窗口用完：
-  不再拿旧结果顶着，落回同步回源与现有兜底分类（`STALE_FALLBACK` / `DEGRADED`）。
+- 后台更新**确实发到上游**且失败/超时，才计入连续失败；达到 `gateway.swr-max-background-failures` 次，
+  或宽限窗口用完：不再拿旧结果顶着，落回同步回源与现有兜底分类（`STALE_FALLBACK` / `DEGRADED`）。
+- 后台更新**没真正发到上游**（被全局容量拦回、或熔断保护期被跳过）不算失败：
+  旧结果保持有效，窗口内请求照常返回 `STALE_REFRESHING`，下一次请求会重试后台更新。
+  这类跳过单独计入指标 `backgroundRefreshSkipped`，与 `backgroundRefreshFailures` 明确区分。
 - 边界确定：`age < ttl` 为新鲜；`ttl <= age < ttl + grace` 为宽限窗口；`age >= ttl + grace` 落回同步路径。
 
 ## 全局容量保护与有界排队
@@ -61,6 +64,10 @@ client → GatewayController → CacheGatewayService → SimulatedUpstream
   两种拒绝语义明确区分，指标分别计入 `queueWaitTimeouts` / `capacityExceeded`。
 - **不误伤**：缓存命中（`FRESH`/`STALE_REFRESHING`）与单飞合并的跟随者不占用全局名额，
   保护只作用在真实回源压力上。
+- **旧结果优先于拒绝**：容量占满（排队没等到或总量超限）时，只要手里还有旧结果
+  （含宽限窗口内与已过窗口的过期缓存），请求照旧拿到旧值（`STALE_REFRESHING`/`STALE_FALLBACK`），
+  不会被变成 429；只有完全没有旧结果可用、确实需要新数据的请求，
+  才按 `QUEUE_WAIT_TIMEOUT` / `CAPACITY_EXCEEDED` 两种语义拒绝。
 - 排队有界且等待有超时，上游持续不恢复时调用方不会无限等待。
 
 ## 熔断器
@@ -71,7 +78,11 @@ client → GatewayController → CacheGatewayService → SimulatedUpstream
   其余请求仍然兜底（不丢请求，也不放一大批试探）。
 - 试探成功 → 恢复 CLOSED；试探失败 → 重新进入保护期。
 - 排队超时/总量超限/熔断拦截不计入熔断失败次数（未真正打到上游）。
-- 当前状态与累计开路次数从指标导出：`GET /api/metrics` 的 `circuit.state` / `circuit.openCount`。
+- 试探许可拿到后、尚未打到上游就被容量拦回（排队没等到/总量超限）时，试探名额立即归还：
+  不算成功也不算失败，状态保持 HALF_OPEN，容量恢复后下一个试探照常放行，
+  熔断器不会卡在试探期出不来。
+- 当前状态与累计开路次数从指标导出：`GET /api/metrics` 的 `circuit.state`（CLOSED/OPEN/HALF_OPEN）、
+  `circuit.openCount`、`circuit.halfOpenInFlight`（试探期在飞的试探请求数）。
 
 ## 并发保护策略
 
@@ -89,7 +100,7 @@ client → GatewayController → CacheGatewayService → SimulatedUpstream
 | `gateway.simulated-latency-millis` | 50 | 模拟上游延迟 |
 | `gateway.simulated-failure` | false | 模拟上游故障开关 |
 | `gateway.swr-grace-millis` | 0 | 过期后的宽限窗口；0 表示关闭（保持旧行为） |
-| `gateway.swr-max-background-failures` | 3 | 宽限窗口内后台更新连续失败上限，达到后落回兜底 |
+| `gateway.swr-max-background-failures` | 3 | 宽限窗口内后台更新连续失败上限（只计真正打到上游的失败），达到后落回兜底 |
 | `gateway.max-concurrent-upstream` | 16 | 全局同时回源的最大并发数 |
 | `gateway.queue-wait-timeout-millis` | 200 | 全局容量满时排队等待的最长时间 |
 | `gateway.max-queue-size` | 64 | 全局等待队列长度上限，超出即总量超限拒绝 |
@@ -102,8 +113,12 @@ client → GatewayController → CacheGatewayService → SimulatedUpstream
 - `GET /api/data/{key}` — 读取数据，返回 `{key, value, origin, fetchedAt, elapsedMillis}`；
   拒绝时返回 429，`error` 区分 `OVERLOAD_REJECTED`（单 key 超限）/
   `QUEUE_WAIT_TIMEOUT`（排队没等到）/`CAPACITY_EXCEEDED`（总量超限）。
+  注意：后两种拒绝只发生在完全没有任何旧结果可用的请求上；手里还有旧结果的请求
+  在容量占满时返回 200 + `STALE_REFRESHING`/`STALE_FALLBACK`。
 - `GET /api/metrics` — 导出指标快照：请求总量、各 origin 计数、拒绝/合并/上游调用与失败计数、
-  后台更新计数、排队超时与总量超限计数、`circuit`（熔断状态与开路次数）、
+  后台更新计数（`backgroundRefreshes`/`backgroundRefreshFailures`/`backgroundRefreshSkipped`，
+  分别表示后台更新尝试、真正打到上游的失败、未真正发出的跳过）、
+  排队超时与总量超限计数、`circuit`（`state`/`openCount`/`halfOpenInFlight`）、
   `admission`（当前回源并发与排队数）、耗时 p50/p95/p99/max。
 - `POST /api/upstream/config?latencyMs=&failure=` — 运行期调整模拟上游行为。
 
@@ -113,6 +128,13 @@ client → GatewayController → CacheGatewayService → SimulatedUpstream
   旧的三类（`FRESH`/`STALE_FALLBACK`/`DEGRADED`）语义不变。
 - `gateway.swr-grace-millis` 默认为 0：不配置时宽限窗口关闭，过期行为与上一轮完全一致。
 - 全局准入与熔断器默认参数宽松（16 并发 / 5 次失败），不影响既有单测与本地演示路径。
+- 本轮行为修正（均为收紧误伤、不改变正常路径）：
+  - 宽限窗口内的后台更新被容量拦回/保护期跳过时，不再计入 `swr-max-background-failures`
+    （此前会让窗口内的旧结果提前失效）；只有真正打到上游的失败/超时才计数。
+  - 容量占满时，手里还有旧结果的请求返回 200 + 旧值（此前可能返回 429）；
+    完全没有旧结果的请求拒绝语义不变，仍为 `QUEUE_WAIT_TIMEOUT` / `CAPACITY_EXCEEDED`。
+  - 试探许可被容量拦回时归还试探名额（此前名额泄漏会让熔断器卡在 HALF_OPEN）。
+- 指标快照新增 `backgroundRefreshSkipped` 与 `circuit.halfOpenInFlight` 两个字段，纯增量。
 
 ## 本地验证
 
@@ -153,6 +175,10 @@ sleep 1                                        # 等后台更新完成
 curl localhost:8080/api/data/swr-demo          # FRESH（新值）
 # 上游故障时窗口内仍返回 STALE_REFRESHING；连续失败达到上限后落回 STALE_FALLBACK
 curl -X POST "localhost:8080/api/upstream/config?failure=true"
+
+# 熔断进入保护期后（连续失败达到阈值），窗口内的旧结果同样照常返回：
+# 后台更新被保护期跳过，计入 backgroundRefreshSkipped 而不是失败，
+# 窗口内请求始终是 200 STALE_REFRESHING；保护期结束、上游恢复后后台更新成功 → FRESH
 ```
 
 ### 排队等待超时 / 总量超限复现
@@ -167,6 +193,28 @@ curl localhost:8080/api/data/slow-b &          # 进入队列，200ms 后 429 QU
 sleep 0.1
 curl localhost:8080/api/data/slow-c            # 队列已满，立即 429 CAPACITY_EXCEEDED
 # 期间读取已缓存的 key 仍正常返回 200 FRESH（缓存命中不占全局名额）
+```
+
+### 容量占满时“还有旧结果”的请求复现
+
+```bash
+# 启动时配置：gateway.cache-ttl-millis=2000 gateway.swr-grace-millis=30000
+#             gateway.max-concurrent-upstream=1 gateway.max-queue-size=0
+#             gateway.max-concurrent-per-key=32
+curl localhost:8080/api/data/stale-demo        # FRESH，建立缓存
+sleep 3                                        # 进入宽限窗口
+curl -X POST "localhost:8080/api/upstream/config?latencyMs=5000&failure=false"
+curl localhost:8080/api/data/holder &          # 慢请求占住唯一全局许可（maxQueueSize=0）
+sleep 0.5
+# 容量已占满，但窗口内的旧结果照常返回，且不会被变成 429：
+for i in 1 2 3 4 5; do curl localhost:8080/api/data/stale-demo; done
+#   全部 200 STALE_REFRESHING（旧值）；指标里 backgroundRefreshSkipped 增长、
+#   backgroundRefreshFailures 不增长（后台更新被容量拦回，没真正打到上游，不算失败）
+curl localhost:8080/api/metrics
+# 没有缓存的 key 才会被拒：
+curl localhost:8080/api/data/no-cache          # 429 CAPACITY_EXCEEDED
+# holder 结束后（latencyMs 调回 50）再读 stale-demo：后台更新成功 → 200 FRESH（新值）
+curl -X POST "localhost:8080/api/upstream/config?latencyMs=50"
 ```
 
 ### 熔断器复现（正常 → 保护 → 试探 → 恢复）
@@ -200,4 +248,12 @@ curl localhost:8080/api/data/cb-recover        # 试探成功 → FRESH，circui
   - 缓存命中与单飞合并在全局容量占满时不被误伤。
   - 熔断完整过程：连续失败 → OPEN 不打上游 → 试探失败续保护 → 试探成功恢复。
   - 试探期并发限制：6 并发只放 1 个试探，其余兜底不丢请求。
+- `CacheGatewayStaleProtectionTest`（本轮 bugfix 新增，日志含配置与判定依据）
+  - 宽限窗口 × 容量占满：4 轮并发（拦回次数超过失败上限）窗口内请求始终 `STALE_REFRESHING`，
+    后台更新记 `backgroundRefreshSkipped` 不计失败，容量释放后后台更新成功。
+  - 宽限窗口 × 保护期：保护期内窗口内请求始终 `STALE_REFRESHING` 且不打上游，
+    熔断恢复后后台更新成功。
+  - 总量超限/排队超时 × 旧结果：有旧结果 → `STALE_FALLBACK`；无旧结果 → 两种拒绝可区分。
+  - 试探名额不泄漏：试探被容量拦回后 `halfOpenInFlight` 归零、保持 HALF_OPEN，
+    容量恢复后下一个试探放行并恢复 CLOSED，状态全程可从指标观察。
 - `GatewayControllerTest`：REST 读取、运行期调参触发降级、指标导出。

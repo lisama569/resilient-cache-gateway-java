@@ -32,6 +32,7 @@ public class GatewayMetrics {
     private final LongAdder coalesced = new LongAdder();
     private final LongAdder backgroundRefreshes = new LongAdder();
     private final LongAdder backgroundRefreshFailures = new LongAdder();
+    private final LongAdder backgroundRefreshSkipped = new LongAdder();
     private final LongAdder queueWaitTimeouts = new LongAdder();
     private final LongAdder capacityExceeded = new LongAdder();
 
@@ -60,9 +61,14 @@ public class GatewayMetrics {
         backgroundRefreshes.increment();
     }
 
-    /** 记录一次后台更新失败。 */
+    /** 记录一次后台更新失败（确实发到上游且失败/超时）。 */
     public void recordBackgroundRefreshFailure() {
         backgroundRefreshFailures.increment();
+    }
+
+    /** 记录一次未真正发到上游的后台更新（被容量保护拦回或保护期跳过）。 */
+    public void recordBackgroundRefreshSkipped() {
+        backgroundRefreshSkipped.increment();
     }
 
     /** 记录一次排队等待超时。 */
@@ -129,6 +135,7 @@ public class GatewayMetrics {
         map.put("upstreamFailures", upstreamFailures.sum());
         map.put("backgroundRefreshes", backgroundRefreshes.sum());
         map.put("backgroundRefreshFailures", backgroundRefreshFailures.sum());
+        map.put("backgroundRefreshSkipped", backgroundRefreshSkipped.sum());
         map.put("queueWaitTimeouts", queueWaitTimeouts.sum());
         map.put("capacityExceeded", capacityExceeded.sum());
         map.put("circuit", circuitStatus());
@@ -142,6 +149,7 @@ public class GatewayMetrics {
         CircuitBreaker breaker = circuitBreaker;
         result.put("state", breaker != null ? breaker.state().name() : "UNKNOWN");
         result.put("openCount", breaker != null ? breaker.openCount() : 0);
+        result.put("halfOpenInFlight", breaker != null ? breaker.halfOpenInFlight() : 0);
         return result;
     }
 

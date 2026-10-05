@@ -60,6 +60,20 @@ public class CircuitBreaker {
         }
     }
 
+    /**
+     * 许可拿到后、尚未真正打到上游就放弃（如全局容量排队被拒）时归还许可。
+     * 只在试探期有意义：释放试探名额，避免名额泄漏导致熔断器卡在 HALF_OPEN 出不来。
+     * 不算成功也不算失败，状态不变。
+     */
+    public void releasePermission() {
+        synchronized (lock) {
+            if (state == State.HALF_OPEN) {
+                halfOpenInFlight = Math.max(0, halfOpenInFlight - 1);
+                log.info("[circuit] HALF_OPEN probe slot released (not sent) inFlight={}", halfOpenInFlight);
+            }
+        }
+    }
+
     /** 上报一次上游成功。 */
     public void onSuccess() {
         synchronized (lock) {
@@ -101,6 +115,14 @@ public class CircuitBreaker {
     public long openCount() {
         synchronized (lock) {
             return openCount;
+        }
+    }
+
+    /** 试探期当前在飞的试探请求数（用于指标导出，CLOSED/OPEN 时恒为 0）。 */
+    public int halfOpenInFlight() {
+        synchronized (lock) {
+            transitionIfOpenExpired();
+            return state == State.HALF_OPEN ? halfOpenInFlight : 0;
         }
     }
 

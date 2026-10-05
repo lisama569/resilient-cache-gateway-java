@@ -23,10 +23,12 @@ import java.util.concurrent.TimeoutException;
  *   <li>TTL 缓存：有效期内直接返回新鲜结果，过期后重新回源，绝不把过期内容当新鲜返回。</li>
  *   <li>宽限窗口（SWR）：过期后的一段可配置宽限时间内，请求立即拿到旧结果
  *       （{@link ResultOrigin#STALE_REFRESHING}），同时只触发一次后台更新；
- *       后台更新连续失败达到上限或宽限时间用完后，落回同步回源与兜底分类。</li>
+ *       后台更新只有确实发到上游且失败/超时才计入连续失败，达到上限后落回同步回源与兜底分类；
+ *       被容量保护拦回或保护期跳过的后台更新不影响旧结果的可用性。</li>
  *   <li>单飞合并：同一 key 过期/未命中时只放行一个回源请求，其余请求共享其结果。</li>
  *   <li>全局准入：真实回源前经过全局并发上限与有界排队，缓存命中与合并跟随者不占用名额；
- *       排队超时与总量超限是两种明确区分的拒绝。</li>
+ *       手里还有旧结果的请求在容量占满时照旧拿到旧结果，只有完全没有旧结果可用的请求
+ *       才按排队超时与总量超限两种明确区分的拒绝处理。</li>
  *   <li>熔断器：上游连续失败/超时达到阈值后进入保护期，期间直接走兜底；
  *       保护期结束后放少量请求试探，成功恢复、失败继续保护。</li>
  *   <li>超时与降级：上游超时或失败时，有过期缓存则返回过期兜底，否则返回降级结果。</li>
@@ -180,24 +182,35 @@ public class CacheGatewayService {
         }
         upstreamExecutor.submit(() -> {
             boolean failed = false;
+            boolean skipped = false;
             try {
                 metrics.recordBackgroundRefresh();
                 String value = guardedUpstreamFetch(key);
                 cache.put(key, new CacheEntry(value, Instant.now(), 0));
                 log.info("[gateway] key={} background refresh OK", key);
+            } catch (CircuitOpenException | GlobalAdmissionLimiter.QueueWaitTimeoutException
+                     | GlobalAdmissionLimiter.CapacityExceededException e) {
+                // 没真正发到上游（保护期跳过 / 容量拦回）：不计入连续失败，
+                // 窗口内的旧结果保持有效，后续请求照常返回旧结果并重试后台更新。
+                skipped = true;
+                log.info("[gateway] key={} background refresh SKIPPED (not sent): {}", key, e.getMessage());
             } catch (RuntimeException e) {
                 failed = true;
+                // 只有确实发到上游且失败/超时才计入连续失败。
                 // 只给仍是旧内容的条目累加失败次数；期间若已被同步回源刷新则不动。
                 cache.computeIfPresent(key, (k, entry) -> entry.isFresh(properties.getCacheTtlMillis())
                         ? entry
                         : new CacheEntry(entry.value(), entry.fetchedAt(), entry.backgroundFailures() + 1));
                 log.warn("[gateway] key={} background refresh FAILED: {}", key, e.getMessage());
             } finally {
-                // 先移除“更新进行中”标记再记失败指标：外部观察到失败计数时，
+                // 先移除“更新进行中”标记再记指标：外部观察到计数变化时，
                 // 本轮后台更新已彻底结束，下一次请求可以正常触发新一轮更新。
                 backgroundRefreshes.remove(key, marker);
                 if (failed) {
                     metrics.recordBackgroundRefreshFailure();
+                }
+                if (skipped) {
+                    metrics.recordBackgroundRefreshSkipped();
                 }
                 marker.complete(null);
             }
@@ -220,7 +233,11 @@ public class CacheGatewayService {
         }
     }
 
-    /** 回源：熔断开路直接兜底；排队超时/总量超限向上抛出明确拒绝；上游失败走兜底。 */
+    /**
+     * 回源：熔断开路直接兜底；容量拒绝时手里还有旧结果则返回过期兜底，
+     * 只有完全没有旧结果可用的请求才把排队超时/总量超限作为明确拒绝向上抛出；
+     * 上游失败走兜底。
+     */
     private GatewayResponse fetchFromUpstream(String key, CacheEntry cached, long startNanos) {
         try {
             String value = guardedUpstreamFetch(key);
@@ -232,11 +249,19 @@ public class CacheGatewayService {
         } catch (CircuitOpenException e) {
             log.info("[gateway] key={} circuit OPEN/HALF_OPEN-full -> fallback", key);
             return fallback(key, cached, startNanos, e);
+        } catch (GlobalAdmissionLimiter.QueueWaitTimeoutException
+                 | GlobalAdmissionLimiter.CapacityExceededException e) {
+            if (cached != null) {
+                // 容量被占满不该把“还有旧结果可用”的请求变成报错：照旧把旧结果给调用方。
+                log.info("[gateway] key={} capacity rejection but stale available -> STALE_FALLBACK: {}",
+                        key, e.getMessage());
+                return fallback(key, cached, startNanos, e);
+            }
+            throw e; // 确实需要新数据又没排到队：两种拒绝语义向上传递
         } catch (UpstreamFetchException e) {
             log.warn("[gateway] key={} upstream failed: {}", key, e.getMessage());
             return fallback(key, cached, startNanos, e.getCause());
         }
-        // QueueWaitTimeoutException / CapacityExceededException 不捕获：明确拒绝语义向上传递
     }
 
     /**
@@ -247,7 +272,14 @@ public class CacheGatewayService {
         if (!circuitBreaker.tryAcquirePermission()) {
             throw new CircuitOpenException("circuit breaker is " + circuitBreaker.state());
         }
-        admissionLimiter.acquire();
+        try {
+            admissionLimiter.acquire();
+        } catch (RuntimeException e) {
+            // 许可已拿到但没真正打到上游（容量排队被拒）：归还试探名额，
+            // 否则试探名额泄漏会让熔断器卡在 HALF_OPEN 出不来。
+            circuitBreaker.releasePermission();
+            throw e;
+        }
         boolean success = false;
         try {
             metrics.recordUpstreamCall();
