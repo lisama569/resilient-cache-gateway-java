@@ -60,6 +60,20 @@ public class CircuitBreaker {
         }
     }
 
+    /**
+     * 许可已拿到、但请求未真正打到上游（如被全局容量保护挡回：排队超时/总量超限）时调用。
+     * 不计入连续失败，只归还试探名额，避免试探期名额泄漏导致熔断器卡在 HALF_OPEN 出不来。
+     */
+    public void onAdmissionRejected() {
+        synchronized (lock) {
+            if (state == State.HALF_OPEN) {
+                halfOpenInFlight = Math.max(0, halfOpenInFlight - 1);
+                log.info("[circuit] probe aborted before reaching upstream (admission rejected), "
+                        + "slot released inFlight={}", halfOpenInFlight);
+            }
+        }
+    }
+
     /** 上报一次上游成功。 */
     public void onSuccess() {
         synchronized (lock) {
@@ -101,6 +115,14 @@ public class CircuitBreaker {
     public long openCount() {
         synchronized (lock) {
             return openCount;
+        }
+    }
+
+    /** 当前正在进行的试探请求数（用于指标导出，观察试探期是否卡住）。 */
+    public int halfOpenInFlight() {
+        synchronized (lock) {
+            transitionIfOpenExpired();
+            return state == State.HALF_OPEN ? halfOpenInFlight : 0;
         }
     }
 

@@ -23,7 +23,8 @@ import java.util.concurrent.TimeoutException;
  *   <li>TTL 缓存：有效期内直接返回新鲜结果，过期后重新回源，绝不把过期内容当新鲜返回。</li>
  *   <li>宽限窗口（SWR）：过期后的一段可配置宽限时间内，请求立即拿到旧结果
  *       （{@link ResultOrigin#STALE_REFRESHING}），同时只触发一次后台更新；
- *       后台更新连续失败达到上限或宽限时间用完后，落回同步回源与兜底分类。</li>
+ *       未真正打到上游的更新（容量保护挡回/熔断保护期跳过）不计入连续失败、不让旧结果失效；
+ *       真正打到上游且失败/超时才计数，达到上限或宽限时间用完后，落回同步回源与兜底分类。</li>
  *   <li>单飞合并：同一 key 过期/未命中时只放行一个回源请求，其余请求共享其结果。</li>
  *   <li>全局准入：真实回源前经过全局并发上限与有界排队，缓存命中与合并跟随者不占用名额；
  *       排队超时与总量超限是两种明确区分的拒绝。</li>
@@ -185,7 +186,16 @@ public class CacheGatewayService {
                 String value = guardedUpstreamFetch(key);
                 cache.put(key, new CacheEntry(value, Instant.now(), 0));
                 log.info("[gateway] key={} background refresh OK", key);
+            } catch (CircuitOpenException
+                     | GlobalAdmissionLimiter.QueueWaitTimeoutException
+                     | GlobalAdmissionLimiter.CapacityExceededException e) {
+                // 未真正打到上游（熔断保护期跳过 / 被自身容量保护挡回）：
+                // 不算连续失败、不让窗口内的旧结果失效，下一个请求可再次触发更新。
+                metrics.recordBackgroundRefreshSkipped();
+                log.info("[gateway] key={} background refresh SKIPPED (not sent upstream): {}",
+                        key, e.getMessage());
             } catch (RuntimeException e) {
+                // 确实打到上游且失败/超时：才按连续失败累加，达到上限后落回兜底。
                 failed = true;
                 // 只给仍是旧内容的条目累加失败次数；期间若已被同步回源刷新则不动。
                 cache.computeIfPresent(key, (k, entry) -> entry.isFresh(properties.getCacheTtlMillis())
@@ -247,7 +257,14 @@ public class CacheGatewayService {
         if (!circuitBreaker.tryAcquirePermission()) {
             throw new CircuitOpenException("circuit breaker is " + circuitBreaker.state());
         }
-        admissionLimiter.acquire();
+        try {
+            admissionLimiter.acquire();
+        } catch (RuntimeException e) {
+            // 容量保护挡回（排队超时/总量超限）：未真正打到上游，
+            // 归还试探名额避免熔断器卡在试探期，且不计入熔断连续失败。
+            circuitBreaker.onAdmissionRejected();
+            throw e;
+        }
         boolean success = false;
         try {
             metrics.recordUpstreamCall();
